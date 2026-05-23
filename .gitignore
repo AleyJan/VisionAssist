@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Model files (too large for GitHub)
+*.pt
+*.onnx
+*.mf
+*.gz
+
+# Models folder (downloaded separately)
+models/
+
+# Virtual environment
+yolo-env/
+
+# Evaluation outputs
+evaluation/
+runs/
+*.jpg
+*.avi

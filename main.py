@@ -1,13 +1,16 @@
 import time
 import threading
 import cv2
-from picamera2 import Picamera2
+import numpy as np
 from ultralytics import YOLO
 from speech import Speaker
 from reading_mode import ReadingMode
 from voice_recognition import VoiceRecognizer
 from moondream_mode import SceneDescriber
 
+# ─────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────
 YOLO_N_PATH  = '/home/raspberrypi/VisionAssist/models/yolo11n.onnx'
 YOLO_S_PATH  = '/home/raspberrypi/VisionAssist/models/yolo11s.onnx'
 CONF_N       = 0.80
@@ -17,7 +20,12 @@ COOLDOWN     = 6
 MIN_FRAMES   = 3
 FRAME_WIDTH  = 640
 FRAME_HEIGHT = 480
+CAMERA_INDEX = 0
+SHOW_WINDOW  = False
 
+# ─────────────────────────────────────────
+# PRIORITY CLASSES
+# ─────────────────────────────────────────
 PRIORITY_CLASSES = {
     "person",
     "car", "motorcycle", "bus", "truck", "bicycle",
@@ -29,37 +37,74 @@ PRIORITY_CLASSES = {
 }
 
 
+# ─────────────────────────────────────────
+# THREADED CAMERA
+# ─────────────────────────────────────────
+class ThreadedCamera:
+    """
+    Captures frames continuously in background thread.
+    YOLO always gets latest frame without waiting for camera.
+    """
+    def __init__(self, index=0):
+        self.cap = cv2.VideoCapture(index)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not self.cap.isOpened():
+            raise RuntimeError("Cannot open webcam!")
+
+        self.frame   = None
+        self.lock    = threading.Lock()
+        self.running = True
+
+        threading.Thread(target=self._capture_loop, daemon=True).start()
+        time.sleep(0.5)
+        print(f"[Camera] Threaded capture started at /dev/video{index}")
+
+    def _capture_loop(self):
+        while self.running:
+            ret, frame = self.cap.read()
+            if ret:
+                with self.lock:
+                    self.frame = frame
+
+    def read(self):
+        with self.lock:
+            if self.frame is None:
+                return None
+            return self.frame.copy()
+
+    def stop(self):
+        self.running = False
+        self.cap.release()
+        print("[Camera] Stopped")
+
+
+# ─────────────────────────────────────────
+# DETECTION ENGINE
+# ─────────────────────────────────────────
 class DetectionEngine:
+    """
+    Handles threaded camera, preprocessing, and dual YOLO inference.
+    YOLO11n runs every frame for real-time safety.
+    YOLO11s runs every 10 frames for small object detection.
+    """
     def __init__(self):
-        print("[Camera] Starting...")
-        self.picam2 = Picamera2()
-        self.picam2.configure(self.picam2.create_preview_configuration(
-            main={"format": "RGB888", "size": (FRAME_WIDTH, FRAME_HEIGHT)},
-            controls={
-                "Brightness": 0.15,
-                "Contrast": 1.25,
-                "Saturation": 1.1,
-                "Sharpness": 1.0,
-                "ExposureTime": 25000,
-                "AnalogueGain": 1.8
-            }
-        ))
-        self.picam2.start()
-        print("[Camera] Ready!")
+        print("[Camera] Starting USB webcam...")
+        self.camera = ThreadedCamera(CAMERA_INDEX)
+
         print("[YOLO] Loading models...")
-        self.model_n = YOLO(YOLO_N_PATH, task='detect')
-        self.model_s = YOLO(YOLO_S_PATH, task='detect')
+        self.model_n    = YOLO(YOLO_N_PATH, task='detect')
+        self.model_s    = YOLO(YOLO_S_PATH, task='detect')
         self.frame_count = 0
         print("[YOLO] Both models ready!")
 
     def enhance_frame(self, frame):
-        frame = cv2.convertScaleAbs(frame, alpha=1.25, beta=15)
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        cl = clahe.apply(l)
-        lab = cv2.merge((cl, a, b))
-        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        """Mild preprocessing — A4Tech webcam has good quality."""
+        frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=5)
+        return frame
 
     def get_direction(self, center_x):
         if center_x < FRAME_WIDTH * 0.33:
@@ -77,15 +122,29 @@ class DetectionEngine:
         return "nearby", False
 
     def detect(self):
+        """
+        Gets latest frame from threaded camera.
+        Runs both YOLO models and returns detections.
+        """
         self.frame_count += 1
-        frame = self.picam2.capture_array()
+        frame = self.camera.read()
+
+        if frame is None:
+            return None, None, []
+
         enhanced = self.enhance_frame(frame)
 
-        results_n = self.model_n(enhanced, verbose=False, conf=CONF_N, imgsz=IMGSZ)
-        results_s = None
-        if self.frame_count % 5 == 0:
-            results_s = self.model_s(enhanced, verbose=False, conf=CONF_S, imgsz=IMGSZ)
+        # YOLO11n every frame
+        results_n = self.model_n(enhanced, verbose=False,
+                                  conf=CONF_N, imgsz=IMGSZ)
 
+        # YOLO11s every 10 frames
+        results_s = None
+        if self.frame_count % 10 == 0:
+            results_s = self.model_s(enhanced, verbose=False,
+                                      conf=CONF_S, imgsz=IMGSZ)
+
+        # Collect raw detections
         raw = []
         for results in [results_n, results_s]:
             if results is None:
@@ -101,35 +160,44 @@ class DetectionEngine:
                 urgency, is_urgent = self.get_urgency(box_area)
                 conf = float(box.conf)
                 raw.append({
-                    "label": label,
+                    "label":     label,
                     "direction": direction,
-                    "urgency": urgency,
+                    "urgency":   urgency,
                     "is_urgent": is_urgent,
-                    "conf": conf
+                    "conf":      conf
                 })
 
+        # Deduplicate — keep highest confidence per label+direction
         seen = {}
         for det in raw:
             key = (det['label'], det['direction'])
             if key not in seen or det['conf'] > seen[key]['conf']:
                 seen[key] = det
 
-        return frame, list(seen.values())
+        annotated = results_n[0].plot()
+        return frame, annotated, list(seen.values())
 
     def capture(self):
-        return self.picam2.capture_array()
+        """Get latest frame without running detection."""
+        return self.camera.read()
 
     def stop(self):
-        self.picam2.stop()
-        print("[Camera] Stopped")
+        self.camera.stop()
 
 
+# ─────────────────────────────────────────
+# MAIN APP
+# ─────────────────────────────────────────
 class VisionAssistApp:
     """
+    Main application controller.
+
     Modes:
-      NAVIGATION  — YOLO runs continuously
-      READING     — EasyOCR runs in loop
-      WAITING     — idle after describe/where, auto-returns to nav after 8s
+      NAVIGATION — YOLO runs continuously, announces objects
+      READING    — EasyOCR reads text in background, camera stays live
+      WAITING    — idle after describe/where, auto-returns after 8s
+
+    Wake word: hey vision
     """
     def __init__(self):
         print("[System] Initializing VisionAssist...")
@@ -138,15 +206,22 @@ class VisionAssistApp:
         self.reader   = ReadingMode(self.speaker)
         self.scene    = SceneDescriber(self.speaker)
         self.voice    = VoiceRecognizer(self.on_voice_command)
+
         self.frame_memory   = {}
         self.last_announced = {}
-        self.mode    = "NAVIGATION"
-        self.running = True
-        self.waiting_since = None  # tracks when WAITING mode started
+        self.mode           = "NAVIGATION"
+        self.running        = True
+        self.waiting_since  = None
+        self.nav_count      = 0
+
+        # FPS tracking
+        self.fps_times = []
+        self.fps       = 0
+
         print("[System] All components ready!")
 
     def _go_navigation(self):
-        """Switch cleanly to navigation mode."""
+        """Switch cleanly to navigation mode from any mode."""
         if self.mode == "READING":
             self.reader.stop()
         self.frame_memory.clear()
@@ -168,8 +243,39 @@ class VisionAssistApp:
         cooled = time.time() - self.last_announced.get(label, 0) > COOLDOWN
         return stable and cooled
 
+    def update_fps(self):
+        now = time.time()
+        self.fps_times.append(now)
+        self.fps_times = [t for t in self.fps_times if now - t < 1.0]
+        self.fps = len(self.fps_times)
+
     def run_navigation(self):
-        frame, detections = self.detector.detect()
+        frame, annotated, detections = self.detector.detect()
+
+        if frame is None:
+            return
+
+        self.update_fps()
+        self.nav_count += 1
+
+        # Print FPS every 30 frames
+        if self.nav_count % 30 == 0:
+            print(f"[FPS] {self.fps}", end='\r')
+
+        # Show video window
+        if SHOW_WINDOW and annotated is not None:
+            cv2.putText(annotated, f'Mode: {self.mode}', (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            cv2.putText(annotated, f'FPS: {self.fps}', (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            cv2.putText(annotated, 'Press Q to quit', (10, 90),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            cv2.imshow('VisionAssist', annotated)
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                self.running = False
+                return
+
         detected_labels = [d['label'] for d in detections]
         self.update_stability(detected_labels)
 
@@ -200,7 +306,6 @@ class VisionAssistApp:
         print(f"[Voice] Command: {cmd}")
 
         if cmd == "navigate":
-            # Universal go-back-to-navigation command
             self._go_navigation()
             self.speaker.speak("Navigation mode active.")
 
@@ -213,7 +318,7 @@ class VisionAssistApp:
             self._go_navigation()
             self.mode = "WAITING"
             self.waiting_since = time.time()
-            frame, detections = self.detector.detect()
+            frame, annotated, detections = self.detector.detect()
             self.scene.describe(detections)
             print("[System] Auto-returning to navigation in 8 seconds...")
 
@@ -221,7 +326,7 @@ class VisionAssistApp:
             self._go_navigation()
             self.mode = "WAITING"
             self.waiting_since = time.time()
-            frame, detections = self.detector.detect()
+            frame, annotated, detections = self.detector.detect()
             self.scene.where_am_i(detections)
             print("[System] Auto-returning to navigation in 8 seconds...")
 
@@ -230,12 +335,12 @@ class VisionAssistApp:
             self.mode = "WAITING"
             self.waiting_since = time.time()
             self.speaker.speak(
-                "Commands: "
-                "hey pi read this for reading. "
-                "hey pi stop reading to navigate. "
-                "hey pi describe for scene. "
-                "hey pi where am i for location. "
-                "hey pi start to begin navigation."
+                "Available commands: "
+                "hey vision read this. "
+                "hey vision stop reading. "
+                "hey vision describe. "
+                "hey vision where am i. "
+                "hey vision start."
             )
             print("[System] Auto-returning to navigation in 8 seconds...")
 
@@ -246,23 +351,37 @@ class VisionAssistApp:
 
         try:
             while self.running:
-
                 if self.mode == "NAVIGATION":
                     self.run_navigation()
 
                 elif self.mode == "READING":
-                    frame, _ = self.detector.detect()
-                    if self.mode == "READING":
+                    frame = self.detector.capture()
+                    if SHOW_WINDOW and frame is not None:
+                        display = frame.copy()
+                        cv2.putText(display, 'Mode: READING', (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (0, 0, 255), 2)
+                        cv2.putText(display, 'Scanning for text...', (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                                    (255, 255, 255), 1)
+                        cv2.imshow('VisionAssist', display)
+                        cv2.waitKey(1)
+                    if self.mode == "READING" and frame is not None:
                         self.reader.read_frame(frame)
-                        time.sleep(3)
+                        time.sleep(0.1)
 
                 elif self.mode == "WAITING":
-                    # Keep camera alive while waiting
-                    self.detector.capture()
+                    frame = self.detector.capture()
+                    if SHOW_WINDOW and frame is not None:
+                        display = frame.copy()
+                        cv2.putText(display, 'Mode: WAITING', (10, 30),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    (255, 165, 0), 2)
+                        cv2.imshow('VisionAssist', display)
+                        cv2.waitKey(1)
                     time.sleep(0.2)
-
-                    # Auto-return to navigation after 8 seconds
-                    if self.waiting_since and time.time() - self.waiting_since > 8:
+                    if self.waiting_since and \
+                       time.time() - self.waiting_since > 8:
                         print("[System] Auto-returning to navigation...")
                         self._go_navigation()
 
@@ -277,6 +396,8 @@ class VisionAssistApp:
         self.running = False
         self.voice.stop()
         self.detector.stop()
+        if SHOW_WINDOW:
+            cv2.destroyAllWindows()
         print("[System] All systems offline.")
 
 

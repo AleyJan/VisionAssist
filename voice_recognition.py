@@ -6,19 +6,21 @@ import threading
 
 VOSK_MODEL_PATH = "/home/raspberrypi/VisionAssist/models/vosk/vosk-model-small-en-us-0.15"
 SAMPLE_RATE = 16000
-DEVICE = 0
-GRAMMAR = '["hey", "pi", "read", "this", "stop", "reading", "describe", "where", "am", "i", "help", "start", "navigate", "[unk]"]'
+DEVICE = 1
+GRAMMAR = '["hey", "vision", "read", "this", "stop", "reading", "describe", "where", "am", "i", "help", "start", "navigate", "[unk]"]'
+
 
 class VoiceRecognizer:
     """
     Offline voice command recognition using Vosk.
+    Wake word: hey vision
     Commands:
-      hey pi read this     → reading mode
-      hey pi stop reading  → back to navigation
-      hey pi start         → back to navigation
-      hey pi describe      → describe scene once
-      hey pi where am i    → location guess
-      hey pi help          → list commands
+      hey vision read this     → reading mode
+      hey vision stop reading  → back to navigation
+      hey vision start         → back to navigation
+      hey vision describe      → describe scene once
+      hey vision where am i    → location guess
+      hey vision help          → list commands
     """
     def __init__(self, command_callback):
         print("[Voice] Loading Vosk model...")
@@ -43,23 +45,30 @@ class VoiceRecognizer:
                     self._match_command(text)
 
     def _match_command(self, text):
-        # Stop reading / go back to navigation — check FIRST
-        if "stop" in text and "read" in text:
+        # Stop reading — check FIRST before anything else
+        # "reading" must not trigger "read"
+        if "stop" in text and "reading" in text:
             self.command_callback("navigate")
-        # Explicit navigate/start command
+
+        # Navigate/start explicitly
         elif "start" in text or "navigate" in text:
             self.command_callback("navigate")
-        # Read mode
-        elif "read" in text and "stop" not in text:
+
+        # Read — "reading" alone must NOT trigger this
+        # requires "read" but NOT "reading" and NOT "stop"
+        elif "read" in text and "reading" not in text and "stop" not in text:
             self.command_callback("read")
+
         # Describe scene
         elif "describe" in text:
             self.command_callback("describe")
+
         # Where am I
         elif "where" in text and "am" in text:
             self.command_callback("where am i")
+
         # Help
-        elif "help" in text and "describe" not in text and "read" not in text:
+        elif "help" in text:
             self.command_callback("help")
 
     def start(self):
