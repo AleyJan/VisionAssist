@@ -22,20 +22,38 @@ MIN_FRAMES   = 2
 FRAME_WIDTH  = 640
 FRAME_HEIGHT = 480
 CAMERA_INDEX = 0
-STREAM_PORT  = 5000   # open http://192.168.1.7:5000 in browser
+STREAM_PORT  = 5000
 
 # ─────────────────────────────────────────
-# SAFETY ZONE CONFIG
+# TRAPEZOID SAFETY ZONE CONFIG
+# All values are fractions of frame (0.0 to 1.0)
+# Tune these 4 points to adjust zone shape
+#
+#        [TL]─────[TR]       ← narrow top (far away)
+#         /         \
+#        /           \
+#      [BL]─────────[BR]     ← wide bottom (close)
+#
 # ─────────────────────────────────────────
-ZONE_LEFT   = 0.20
-ZONE_RIGHT  = 0.80
-ZONE_TOP    = 0.10
-ZONE_BOTTOM = 1.00
+ZONE_TL = (0.35, 0.35)   # top left     (far left boundary)
+ZONE_TR = (0.65, 0.35)   # top right    (far right boundary)
+ZONE_BR = (0.95, 1.00)   # bottom right (close right boundary)
+ZONE_BL = (0.05, 1.00)   # bottom left  (close left boundary)
 
-ZX1 = int(FRAME_WIDTH  * ZONE_LEFT)
-ZY1 = int(FRAME_HEIGHT * ZONE_TOP)
-ZX2 = int(FRAME_WIDTH  * ZONE_RIGHT)
-ZY2 = int(FRAME_HEIGHT * ZONE_BOTTOM)
+# Convert to pixels
+TL = (int(ZONE_TL[0] * FRAME_WIDTH), int(ZONE_TL[1] * FRAME_HEIGHT))
+TR = (int(ZONE_TR[0] * FRAME_WIDTH), int(ZONE_TR[1] * FRAME_HEIGHT))
+BR = (int(ZONE_BR[0] * FRAME_WIDTH), int(ZONE_BR[1] * FRAME_HEIGHT))
+BL = (int(ZONE_BL[0] * FRAME_WIDTH), int(ZONE_BL[1] * FRAME_HEIGHT))
+
+# Trapezoid as numpy array for pointPolygonTest
+TRAP_ZONE = np.array([BL, BR, TR, TL], dtype=np.int32)
+
+# ─────────────────────────────────────────
+# MOTION DETECTION CONFIG
+# ─────────────────────────────────────────
+MIN_MOTION_AREA = 800
+MOTION_COOLDOWN = 5
 
 # ─────────────────────────────────────────
 # PRIORITY CLASSES
@@ -56,56 +74,89 @@ PRIORITY_CLASSES = {
 # SAFETY ZONE HELPERS
 # ─────────────────────────────────────────
 def is_inside_zone(cx, cy):
-    return ZX1 < cx < ZX2 and ZY1 < cy < ZY2
+    """
+    Check if point (cx, cy) is inside the trapezoid zone.
+    Uses OpenCV pointPolygonTest — works for any polygon shape.
+    Returns True if inside or on boundary.
+    """
+    result = cv2.pointPolygonTest(
+        TRAP_ZONE, (float(cx), float(cy)), False)
+    return result >= 0
 
 
 def get_zone_direction(cx):
-    zone_width = ZX2 - ZX1
-    third = zone_width / 3
-    if cx < ZX1 + third:
+    """
+    Direction within zone based on horizontal position.
+    Split frame into 3 equal vertical sections.
+    """
+    if cx < FRAME_WIDTH * 0.33:
         return "on your left"
-    elif cx < ZX1 + 2 * third:
+    elif cx < FRAME_WIDTH * 0.66:
         return "directly ahead"
     else:
         return "on your right"
 
 
 def draw_safety_zone(frame):
-    # Yellow zone border
-    cv2.rectangle(frame, (ZX1, ZY1), (ZX2, ZY2),
-                  (0, 255, 255), 2)
-    # Zone label
+    """
+    Draw trapezoid safety zone on frame.
+    Yellow border with section dividers.
+    """
+    # Draw filled trapezoid with low opacity overlay
+    overlay = frame.copy()
+    cv2.fillPoly(overlay, [TRAP_ZONE], (0, 255, 255))
+    cv2.addWeighted(overlay, 0.07, frame, 0.93, 0, frame)
+
+    # Draw trapezoid border
+    cv2.polylines(frame, [TRAP_ZONE], isClosed=True,
+                  color=(0, 255, 255), thickness=2)
+
+    # Zone label at top center of trapezoid
+    label_x = (TL[0] + TR[0]) // 2 - 55
+    label_y = TL[1] - 8
     cv2.putText(frame, 'SAFETY ZONE',
-                (ZX1 + 5, ZY1 + 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                (label_x, label_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (0, 255, 255), 2)
-    # Dividers
-    zone_width = ZX2 - ZX1
-    third = zone_width // 3
-    cv2.line(frame, (ZX1 + third, ZY1),
-             (ZX1 + third, ZY2), (0, 255, 255), 1)
-    cv2.line(frame, (ZX1 + 2*third, ZY1),
-             (ZX1 + 2*third, ZY2), (0, 255, 255), 1)
-    # Section labels
-    cv2.putText(frame, 'LEFT',
-                (ZX1 + 5, ZY1 + 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+
+    # Draw left/center/right divider lines inside trapezoid
+    # These are vertical lines at 1/3 and 2/3 of frame width
+    left_third  = FRAME_WIDTH // 3
+    right_third = 2 * FRAME_WIDTH // 3
+
+    # Left divider
+    cv2.line(frame,
+             (left_third, TL[1]),
+             (left_third, BL[1]),
+             (0, 255, 255), 1)
+
+    # Right divider
+    cv2.line(frame,
+             (right_third, TR[1]),
+             (right_third, BR[1]),
+             (0, 255, 255), 1)
+
+    # Section labels inside zone
+    cv2.putText(frame, 'L',
+                (TL[0] + 10, TL[1] + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (0, 255, 255), 1)
-    cv2.putText(frame, 'CENTER',
-                (ZX1 + third + 5, ZY1 + 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+    cv2.putText(frame, 'C',
+                (FRAME_WIDTH // 2 - 8, TL[1] + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (0, 255, 255), 1)
-    cv2.putText(frame, 'RIGHT',
-                (ZX1 + 2*third + 5, ZY1 + 45),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+    cv2.putText(frame, 'R',
+                (TR[0] - 20, TR[1] + 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                 (0, 255, 255), 1)
+
     return frame
 
 
 # ─────────────────────────────────────────
 # FLASK WEB STREAM
 # ─────────────────────────────────────────
-app_flask = Flask(__name__)
+app_flask    = Flask(__name__)
 latest_frame = None
 frame_lock   = threading.Lock()
 
@@ -123,8 +174,8 @@ def generate_stream():
                 time.sleep(0.05)
                 continue
             frame = latest_frame.copy()
-        ret, jpeg = cv2.imencode('.jpg', frame,
-                                  [cv2.IMWRITE_JPEG_QUALITY, 70])
+        ret, jpeg = cv2.imencode(
+            '.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
         if not ret:
             continue
         yield (b'--frame\r\n'
@@ -161,6 +212,7 @@ def index():
                 justify-content: center;
                 gap: 30px;
                 font-size: 14px;
+                flex-wrap: wrap;
             }
             .dot {
                 display: inline-block;
@@ -169,21 +221,27 @@ def index():
                 margin-right: 6px;
                 vertical-align: middle;
             }
-            .red   { background: #ff3333; }
-            .green { background: #33ff33; }
-            .yellow{ background: #ffff00; }
+            .red    { background: #ff3333; }
+            .green  { background: #33ff33; }
+            .yellow { background: #ffff00; }
+            .orange { background: #ff8800; }
         </style>
     </head>
     <body>
         <h1>VisionAssist — Safety Zone Live View</h1>
         <img src="/video_feed" />
         <div class="legend">
-            <span><span class="dot yellow"></span>Safety Zone</span>
-            <span><span class="dot red"></span>Inside Zone (ALERT)</span>
-            <span><span class="dot green"></span>Outside Zone (safe)</span>
+            <span><span class="dot yellow"></span>
+                  Trapezoid Safety Zone</span>
+            <span><span class="dot red"></span>
+                  Inside Zone (ALERT)</span>
+            <span><span class="dot green"></span>
+                  Outside Zone (safe)</span>
+            <span><span class="dot orange"></span>
+                  Unknown Motion</span>
         </div>
         <p style="color:#888; margin-top:10px; font-size:12px;">
-            Auto-refreshing · http://192.168.1.7:5000
+            Auto-refreshing · http://192.168.1.10:5000
         </p>
     </body>
     </html>
@@ -241,12 +299,77 @@ class ThreadedCamera:
 
 
 # ─────────────────────────────────────────
+# MOTION DETECTOR
+# ─────────────────────────────────────────
+class MotionDetector:
+    def __init__(self):
+        self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=500,
+            varThreshold=50,
+            detectShadows=False
+        )
+        self.warmup_frames = 0
+        print("[Motion] Background subtractor ready!")
+
+    def detect_motion(self, frame):
+        # Apply background subtraction on full frame
+        fg_mask = self.bg_subtractor.apply(frame)
+
+        self.warmup_frames += 1
+        if self.warmup_frames < 30:
+            return []
+
+        # Morphological cleanup
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (5, 5))
+        fg_mask = cv2.morphologyEx(
+            fg_mask, cv2.MORPH_OPEN, kernel)
+        fg_mask = cv2.dilate(
+            fg_mask, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(
+            fg_mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        motion_regions = []
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < MIN_MOTION_AREA:
+                continue
+
+            x, y, w, h = cv2.boundingRect(contour)
+            x1 = x
+            y1 = y
+            x2 = x + w
+            y2 = y + h
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+
+            # Only keep motion INSIDE trapezoid zone
+            if not is_inside_zone(cx, cy):
+                continue
+
+            motion_regions.append({
+                'cx': cx, 'cy': cy,
+                'x1': x1, 'y1': y1,
+                'x2': x2, 'y2': y2,
+                'area': area
+            })
+
+        return motion_regions
+
+
+# ─────────────────────────────────────────
 # DETECTION ENGINE
 # ─────────────────────────────────────────
 class DetectionEngine:
     def __init__(self):
         print("[Camera] Starting USB webcam...")
         self.camera = ThreadedCamera(CAMERA_INDEX)
+        self.motion = MotionDetector()
+
         print("[YOLO] Loading models...")
         self.model_n     = YOLO(YOLO_N_PATH, task='detect')
         self.model_s     = YOLO(YOLO_S_PATH, task='detect')
@@ -261,7 +384,7 @@ class DetectionEngine:
         self.frame_count += 1
         frame = self.camera.read()
         if frame is None:
-            return None, None, [], []
+            return None, None, [], [], []
 
         enhanced = self.enhance_frame(frame)
 
@@ -276,6 +399,7 @@ class DetectionEngine:
         inside_zone  = []
         outside_zone = []
         seen         = {}
+        yolo_zone_boxes = []
 
         for results in [results_n, results_s]:
             if results is None:
@@ -284,6 +408,7 @@ class DetectionEngine:
                 label = results[0].names[int(box.cls)]
                 if label not in PRIORITY_CLASSES:
                     continue
+
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 cx   = int((x1 + x2) / 2)
                 cy   = int((y1 + y2) / 2)
@@ -295,7 +420,7 @@ class DetectionEngine:
                     continue
                 seen[key] = conf
 
-                # RED = inside zone, GREEN = outside
+                # RED = inside, GREEN = outside
                 color = (0, 0, 255) if inside else (0, 255, 0)
 
                 cv2.rectangle(display,
@@ -314,16 +439,56 @@ class DetectionEngine:
                     "cx":        cx,
                     "cy":        cy,
                     "conf":      conf,
-                    "direction": get_zone_direction(cx) if inside
-                                 else self._outer_dir(cx)
+                    "direction": get_zone_direction(cx)
                 }
                 if inside:
                     inside_zone.append(det)
+                    yolo_zone_boxes.append(
+                        (int(x1), int(y1),
+                         int(x2), int(y2)))
                 else:
                     outside_zone.append(det)
 
+        # ── Motion detection ──
+        motion_regions = self.motion.detect_motion(frame)
+        unknown_motion = []
+
+        for region in motion_regions:
+            cx = region['cx']
+            cy = region['cy']
+
+            # Skip if overlaps with YOLO box
+            overlaps = False
+            for (bx1, by1, bx2, by2) in yolo_zone_boxes:
+                if bx1 < cx < bx2 and by1 < cy < by2:
+                    overlaps = True
+                    break
+
+            if not overlaps:
+                # Orange box for unknown motion
+                cv2.rectangle(display,
+                               (region['x1'], region['y1']),
+                               (region['x2'], region['y2']),
+                               (0, 165, 255), 2)
+                cv2.circle(display,
+                            (cx, cy), 5,
+                            (0, 165, 255), -1)
+                cv2.putText(display, 'UNKNOWN',
+                             (region['x1'],
+                              region['y1'] - 8),
+                             cv2.FONT_HERSHEY_SIMPLEX,
+                             0.55, (0, 165, 255), 2)
+                unknown_motion.append({
+                    'cx':        cx,
+                    'cy':        cy,
+                    'direction': get_zone_direction(cx),
+                    'area':      region['area']
+                })
+
+        # Draw trapezoid zone on top
         draw_safety_zone(display)
-        return frame, display, inside_zone, outside_zone
+
+        return frame, display, inside_zone, outside_zone, unknown_motion
 
     def _outer_dir(self, cx):
         if cx < FRAME_WIDTH * 0.33:
@@ -352,6 +517,7 @@ class VisionAssistApp:
         self.voice    = VoiceRecognizer(self.on_voice_command)
 
         self.last_announced = {}
+        self.last_unknown   = 0
         self.nav_count      = 0
         self.mode           = "NAVIGATION"
         self.running        = True
@@ -371,14 +537,16 @@ class VisionAssistApp:
     def update_fps(self):
         now = time.time()
         self.fps_times.append(now)
-        self.fps_times = [t for t in self.fps_times if now - t < 1.0]
+        self.fps_times = [t for t in self.fps_times
+                          if now - t < 1.0]
         self.fps = len(self.fps_times)
 
     def should_announce(self, key):
-        return time.time() - self.last_announced.get(key, 0) > COOLDOWN
+        return (time.time() -
+                self.last_announced.get(key, 0)) > COOLDOWN
 
     def run_navigation(self):
-        frame, display, inside_zone, outside_zone = \
+        frame, display, inside_zone, outside_zone, unknown_motion = \
             self.detector.detect()
 
         if frame is None:
@@ -387,7 +555,6 @@ class VisionAssistApp:
         self.update_fps()
         self.nav_count += 1
 
-        # Add HUD info to display
         if display is not None:
             cv2.putText(display, f'Mode: {self.mode}',
                         (10, 25),
@@ -398,16 +565,17 @@ class VisionAssistApp:
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6, (255, 255, 0), 2)
             cv2.putText(display,
-                        f'IN ZONE: {len(inside_zone)}  '
-                        f'OUTSIDE: {len(outside_zone)}',
+                        f'IN:{len(inside_zone)} '
+                        f'OUT:{len(outside_zone)} '
+                        f'UNK:{len(unknown_motion)}',
                         (10, 75),
                         cv2.FONT_HERSHEY_SIMPLEX,
-                        0.55, (200, 200, 200), 1)
-            # Send to web stream
+                        0.5, (200, 200, 200), 1)
             set_latest_frame(display)
 
-        # Audio — inside zone only
         now = time.time()
+
+        # Announce YOLO identified objects inside zone
         for det in inside_zone:
             label     = det['label']
             direction = det['direction']
@@ -418,10 +586,23 @@ class VisionAssistApp:
                 self.speaker.speak(message)
                 print(f"[ZONE ALERT] {message}")
 
+        # Announce unknown motion
+        if unknown_motion and not inside_zone:
+            if now - self.last_unknown > MOTION_COOLDOWN:
+                biggest = max(unknown_motion,
+                              key=lambda r: r['area'])
+                direction = biggest['direction']
+                message = f"unknown object {direction}"
+                self.speaker.speak(message)
+                self.last_unknown = now
+                print(f"[UNKNOWN] {message}")
+
         if self.nav_count % 30 == 0:
             print(f"[FPS] {self.fps} | "
-                  f"IN: {len(inside_zone)} | "
-                  f"OUT: {len(outside_zone)}", end='\r')
+                  f"IN:{len(inside_zone)} | "
+                  f"OUT:{len(outside_zone)} | "
+                  f"UNK:{len(unknown_motion)}",
+                  end='\r')
 
     def on_voice_command(self, cmd):
         print(f"[Voice] Command: {cmd}")
@@ -436,14 +617,16 @@ class VisionAssistApp:
             self._go_navigation()
             self.mode = "WAITING"
             self.waiting_since = time.time()
-            frame, display, inside, outside = self.detector.detect()
+            frame, display, inside, outside, unknown = \
+                self.detector.detect()
             self.scene.describe(inside + outside)
             print("[System] Auto-returning in 8 seconds...")
         elif cmd == "where am i":
             self._go_navigation()
             self.mode = "WAITING"
             self.waiting_since = time.time()
-            frame, display, inside, outside = self.detector.detect()
+            frame, display, inside, outside, unknown = \
+                self.detector.detect()
             self.scene.where_am_i(inside + outside)
             print("[System] Auto-returning in 8 seconds...")
         elif cmd == "help":
@@ -459,13 +642,14 @@ class VisionAssistApp:
             )
 
     def run(self):
-        # Start Flask stream in background thread
         threading.Thread(target=start_flask,
                          daemon=True).start()
-        print(f"[Stream] Live view at http://192.168.1.7:{STREAM_PORT}")
+        print(f"[Stream] Live view at "
+              f"http://192.168.1.10:{STREAM_PORT}")
 
         self.voice.start()
-        self.speaker.speak("VisionAssist ready. Navigation mode active.")
+        self.speaker.speak(
+            "VisionAssist ready. Navigation mode active.")
         print("[System] Running. Ctrl+C to stop.")
 
         try:
@@ -499,7 +683,7 @@ class VisionAssistApp:
                     time.sleep(0.2)
                     if self.waiting_since and \
                        time.time() - self.waiting_since > 8:
-                        print("[System] Auto-returning to navigation...")
+                        print("[System] Auto-returning...")
                         self._go_navigation()
 
                 else:
